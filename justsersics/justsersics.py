@@ -1,3 +1,206 @@
-# -*- coding: utf-8 -*-
+from __future__ import print_function, division
 
-"""Main module."""
+import numpy as np
+import skimage
+from astropy.utils.exceptions import AstropyDeprecationWarning
+import warnings
+warnings.simplefilter('ignore', category = AstropyDeprecationWarning)
+from astropy.utils import lazyproperty
+from astropy.modeling.models import Sersic2D
+from astropy.modeling import fitting
+from astropy.convolution import convolve_fft
+from photutils import EllipticalAperture
+default_fitter = fitting.LevMarLSQFitter()
+from .log import logger
+DEFAULT_BOUNDS = dict(r_eff=(0, np.inf))
+
+
+__all__ = ['PSFConvolvedSersic2D', 'SersicFit']
+
+
+class PSFConvolvedSersic2D(Sersic2D):
+    """
+    PSF convolved astropy 2D Sersic model.
+    Parameters
+    ----------
+    psf : ndarray
+        Image psf
+    """
+    
+    def __init__(self, psf, amplitude=1, r_eff=1, n=4, x_0=0, y_0=0, 
+                 ellip=0, theta=0, **kwargs):
+        super().__init__(amplitude, r_eff, n, x_0, y_0, ellip, theta, **kwargs)
+        psf /= psf.sum()
+        self.psf = psf
+    
+    def evaluate(self, x, y, amplitude, r_eff, n, x_0, y_0, ellip, theta):
+        sersic = Sersic2D.evaluate(x, y, amplitude, r_eff, n, 
+                                   x_0, y_0, ellip, theta)
+        sersic_conv = convolve_fft(sersic, self.psf, boundary='wrap', 
+                                   normalize_kernel=True)
+        return sersic_conv
+
+
+class SersicFit(object):
+    """
+    Class for calculating morphological properties of a single source.
+    """
+    
+    def __init__(self, image, psf=None, mask=None):
+        
+        self.image = image.astype(np.float64)
+        self.psf = psf
+        if mask is None:
+            mask = np.zeros_like(image, dtype=bool)
+        self.mask = mask
+        self.masked_image = np.ma.masked_array(self.image, mask)
+
+    def set_psf(self, psf):
+        self.psf = psf
+
+    @lazyproperty
+    def diagonal_length(self):
+        dy, dx = self.image.shape
+        return np.sqrt(dx**2 + dy**2)
+    
+    @lazyproperty
+    def centroid(self):
+        M = skimage.measure.moments(self.masked_image.filled(0), order=1)
+        xc = M[0, 1] / M[0, 0]
+        yc = M[1, 0] / M[0, 0]
+        return np.array([xc, yc])
+
+    @lazyproperty
+    def covariance(self):
+        xc, yc = self.centroid
+        M = skimage.measure.moments_central(
+            self.masked_image.filled(0), center=(yc, xc), order=2)
+        cov = np.array([
+            [M[0, 2], M[1, 1]],
+            [M[1, 1], M[2, 0]]]
+        ) / M[0, 0]
+        return cov
+
+    @lazyproperty
+    def eigvals(self):
+        eigvals = np.linalg.eigvals(self.covariance)
+        eigvals = np.sort(np.abs(eigvals))[::-1] 
+        return eigvals
+    
+    @lazyproperty
+    def semimajor_axis(self):
+        return np.sqrt(self.eigvals[0])
+    
+    @lazyproperty
+    def semiminor_axis(self):
+        return np.sqrt(self.eigvals[1])
+    
+    @lazyproperty
+    def ellipticity(self):
+        return 1 - self.semiminor_axis / self.semimajor_axis
+    
+    @lazyproperty
+    def theta(self):
+        """
+        Angle with respect to the positive x-axis in degrees. 
+        It is wrapped to be in [0 deg, 180 deg].
+        """
+        cov = self.covariance
+        # find principal components and rotation angle of ellipse
+        sigma_x2 = cov[0, 0]
+        sigma_y2 = cov[1, 1]
+        sigma_xy = cov[0, 1]
+        theta = 0.5 * np.arctan2(2 * sigma_xy, (sigma_x2 - sigma_y2))
+        wrapped = np.rad2deg(theta) % 360.0
+        wrapped = wrapped - 180 * (wrapped > 180)
+        return wrapped
+
+    @property
+    def residual(self):
+        return self.image - self.model
+
+    def elliptical_mask(self, scale=2, use_sersic_model=False):
+        if use_sersic_model:
+            pars = self.fit_params
+            ell = EllipticalAperture(
+                [pars['x_0'], pars['y_0']], scale * pars['r_eff'],
+                scale * pars['r_eff'] * (1 - pars['ellip']),  
+                np.deg2rad(pars['theta'])
+            )
+        else:
+            ell = EllipticalAperture(
+                self.centroid, scale * self.semimajor_axis,
+                scale * self.semiminor_axis,  np.deg2rad(self.theta)
+            )
+        ell_mask = ell.to_mask()[0].to_image(self.image.shape).astype(bool)
+        return ell_mask
+
+    def fit(self, x_0=0, y_0=0, amplitude=1, r_eff=5.0, n=1.0, ellip=0, 
+            theta=0, psf=None, init_from_image=False, fitter=default_fitter,
+            bounds={}, fixed={}, mask=None, **kwargs): 
+        """
+        Fit 2D PSF-convoled Sersic function to image.
+        """
+
+        if self.psf is not None:
+            psf = self.psf
+        elif psf is None:
+            raise Exception('Must provide PSF!')
+
+        _bounds = DEFAULT_BOUNDS.copy()
+        for k, v in bounds.items():
+            _bounds[k] = v
+
+        if init_from_image:
+            x_0, y_0 = self.centroid
+            r_eff = 1.5 * self.semimajor_axis
+            theta = np.deg2rad(self.theta)
+            ellip = self.ellipticity
+            sliceit = np.s_[int(y_0) - 5:int(y_0) + 5, 
+                            int(x_0) - 5:int(x_0) + 5]
+            amplitude = 0.3 * self.image[sliceit].mean()
+
+        init_params = dict(x_0=x_0, y_0=y_0, r_eff=r_eff, theta=theta, 
+                           ellip=ellip, amplitude=amplitude)
+
+        sersic_init = PSFConvolvedSersic2D(psf, bounds=_bounds, 
+                                           fixed=fixed, **init_params)
+        ny, nx = self.image.shape
+        yy, xx = np.mgrid[:ny, :nx]
+
+        if mask is not None:
+            masked_image = self.masked_image.copy() 
+            masked_image.mask |= mask.astype(bool)
+        else:
+            masked_image = self.masked_image
+
+        sersic_fit = fitter(sersic_init, xx, yy, masked_image, **kwargs)
+
+        params = {}
+        for par, val in zip(sersic_fit.param_names, sersic_fit.parameters):
+            params[par] = val
+
+        params['theta'] = np.rad2deg(params['theta'])
+
+        if params['ellip'] < 0:
+            logger.debug('ell < 0: flipping so that ell > 0')
+            a = (1.0 - params['ellip']) * params['r_eff']
+            b = params['r_eff']
+            params['ellip'] = 1.0 - b/a
+            params['r_eff'] = a
+            params['theta'] -= 90.0
+
+        if (params['theta'] > 180) or (params['theta'] < 0):
+            msg = 'wrapping theta = {:.2f} within 0 < theta < 180'.\
+                  format(params['theta'])
+            logger.debug(msg)
+            wrapped = params['theta'] % 360.0
+            wrapped = wrapped - 180 * (wrapped > 180)
+            params['theta'] = wrapped
+        
+
+        model_image = sersic_fit(xx, yy)
+        
+        self.fit_params = params
+        self.model = model_image
+        self.fit_info = fitter.fit_info

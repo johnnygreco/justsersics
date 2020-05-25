@@ -6,6 +6,7 @@ from __future__ import division, print_function
 
 
 import numpy as np
+from scipy import ndimage
 from astropy.io import fits
 from astropy.convolution import Gaussian2DKernel
 import sep

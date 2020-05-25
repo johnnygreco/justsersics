@@ -8,3 +8,4 @@ __version__ = '0.1.0'
 
 from .justsersics import *
 from . import convert
+from . import masking

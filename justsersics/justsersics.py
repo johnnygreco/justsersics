@@ -2,17 +2,15 @@ from __future__ import print_function, division
 
 import numpy as np
 import skimage
-from astropy.utils.exceptions import AstropyDeprecationWarning
-import warnings
-warnings.simplefilter('ignore', category = AstropyDeprecationWarning)
 from astropy.utils import lazyproperty
 from astropy.modeling.models import Sersic2D
+from astropy.modeling.functional_models import Planar2D
 from astropy.modeling import fitting
 from astropy.convolution import convolve_fft
 from photutils import EllipticalAperture
-default_fitter = fitting.LevMarLSQFitter()
 from .log import logger
-DEFAULT_BOUNDS = dict(r_eff=(0, np.inf))
+DEFAULT_BOUNDS = dict(r_eff=(0, np.inf), n=(0.001, np.inf))
+default_fitter = fitting.LevMarLSQFitter()
 
 
 __all__ = ['PSFConvolvedSersic2D', 'SersicFit']
@@ -30,12 +28,14 @@ class PSFConvolvedSersic2D(Sersic2D):
     def __init__(self, psf, amplitude=1, r_eff=1, n=4, x_0=0, y_0=0, 
                  ellip=0, theta=0, **kwargs):
         super().__init__(amplitude, r_eff, n, x_0, y_0, ellip, theta, **kwargs)
+        self.sersic_deconvolved = Sersic2D(amplitude, r_eff, n, x_0, y_0, 
+                                           ellip, theta, **kwargs)
         psf /= psf.sum()
         self.psf = psf
     
     def evaluate(self, x, y, amplitude, r_eff, n, x_0, y_0, ellip, theta):
-        sersic = Sersic2D.evaluate(x, y, amplitude, r_eff, n, 
-                                   x_0, y_0, ellip, theta)
+        sersic = self.sersic_deconvolved.evaluate(
+            x, y, amplitude, r_eff, n, x_0, y_0, ellip, theta)
         sersic_conv = convolve_fft(sersic, self.psf, boundary='wrap', 
                                    normalize_kernel=True)
         return sersic_conv
@@ -45,6 +45,9 @@ class SersicFit(object):
     """
     Class for calculating morphological properties of a single source.
     """
+
+    sersic_params = ['amplitude', 'ellip', 'n', 'r_eff', 'theta', 'x_0', 'y_0']
+    plane_params = ['slope_x', 'slope_y', 'intercept']
     
     def __init__(self, image, psf=None, mask=None):
         
@@ -119,6 +122,22 @@ class SersicFit(object):
     def residual(self):
         return self.image - self.model
 
+    @property
+    def image_init(self):
+        x_0, y_0 = self.centroid
+        s_ = np.s_[int(y_0) - 5:int(y_0) + 5, 
+                   int(x_0) - 5:int(x_0) + 5]
+        image_init = dict(
+            x_0 = self.centroid[0],
+            y_0 = self.centroid[1],
+            r_eff = 1.5 * self.semimajor_axis,
+            theta = np.deg2rad(self.theta),
+            ellip = self.ellipticity,
+            amplitude = 0.3 * self.image[s_].mean(),
+            n = 1.0
+        )
+        return image_init
+
     def elliptical_mask(self, scale=2, use_sersic_model=False):
         if use_sersic_model:
             pars = self.fit_params
@@ -132,12 +151,12 @@ class SersicFit(object):
                 self.centroid, scale * self.semimajor_axis,
                 scale * self.semiminor_axis,  np.deg2rad(self.theta)
             )
-        ell_mask = ell.to_mask()[0].to_image(self.image.shape).astype(bool)
+        ell_mask = ell.to_mask().to_image(self.image.shape).astype(bool)
         return ell_mask
 
-    def fit(self, x_0=0, y_0=0, amplitude=1, r_eff=5.0, n=1.0, ellip=0, 
-            theta=0, psf=None, init_from_image=False, fitter=default_fitter,
-            bounds={}, fixed={}, mask=None, **kwargs): 
+    def fit(self, bounds={}, fixed={}, mask=None, psf=None, 
+            fitter=default_fitter, fitter_kw={}, tilted_plane_init=None, 
+            **init_params): 
         """
         Fit 2D PSF-convoled Sersic function to image.
         """
@@ -151,20 +170,26 @@ class SersicFit(object):
         for k, v in bounds.items():
             _bounds[k] = v
 
-        if init_from_image:
-            x_0, y_0 = self.centroid
-            r_eff = 1.5 * self.semimajor_axis
-            theta = np.deg2rad(self.theta)
-            ellip = self.ellipticity
-            sliceit = np.s_[int(y_0) - 5:int(y_0) + 5, 
-                            int(x_0) - 5:int(x_0) + 5]
-            amplitude = 0.3 * self.image[sliceit].mean()
-
-        init_params = dict(x_0=x_0, y_0=y_0, r_eff=r_eff, theta=theta, 
-                           ellip=ellip, amplitude=amplitude)
+        init = self.image_init.copy()
+        for k, v in init_params.items():
+            if k not in self.image_init.keys():
+                raise Exception(f'{k} is not a valid initial parameter')
+            init[k] = v
 
         sersic_init = PSFConvolvedSersic2D(psf, bounds=_bounds, 
-                                           fixed=fixed, **init_params)
+                                           fixed=fixed, **init)
+
+        if tilted_plane_init is not None:
+            intercept = self.image_init['amplitude'] / 10
+            kw = dict(slope_x=0, slope_y=0, intercept=intercept)
+            for k, v in tilted_plane_init.items():
+                assert k in kw.keys(), f'{k} is not a valid plane parameter'
+                kw[k] = v
+            self.plane_init = Planar2D(**kw)
+            self.sersic_init = sersic_init + self.plane_init
+        else:
+            self.sersic_init = sersic_init
+
         ny, nx = self.image.shape
         yy, xx = np.mgrid[:ny, :nx]
 
@@ -174,10 +199,14 @@ class SersicFit(object):
         else:
             masked_image = self.masked_image
 
-        sersic_fit = fitter(sersic_init, xx, yy, masked_image, **kwargs)
+        sersic_fit = fitter(self.sersic_init, xx, yy, 
+                            masked_image, **fitter_kw)
+        self.sersic_fitter = sersic_fit
 
         params = {}
         for par, val in zip(sersic_fit.param_names, sersic_fit.parameters):
+            par = par.replace('_0', '')
+            par = par.replace('_1', '')
             params[par] = val
 
         params['theta'] = np.rad2deg(params['theta'])
@@ -197,10 +226,12 @@ class SersicFit(object):
             wrapped = params['theta'] % 360.0
             wrapped = wrapped - 180 * (wrapped > 180)
             params['theta'] = wrapped
-        
 
         model_image = sersic_fit(xx, yy)
-        
+        if tilted_plane_init is not None:
+            plane = Planar2D(params['slope_x'], params['slope_y'], 
+                             params['intercept'])
+            self.plane = plane(xx, yy)
         self.fit_params = params
         self.model = model_image
         self.fit_info = fitter.fit_info

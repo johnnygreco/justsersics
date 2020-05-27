@@ -1,0 +1,6 @@
+numpy>=1.17
+scipy>=1
+astropy>=4
+sep>=1
+scikit-image>=0.17
+photutils>=0.7

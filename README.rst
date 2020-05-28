@@ -1,5 +1,5 @@
 ============
-Just Sersics
+JustSersics
 ============
 
 
@@ -14,7 +14,7 @@ Just Sersics
         :alt: Documentation Status
 
 
-Just Sersic fitting. 
+Just Sersic fitting. That is all. Also tilted planes.
 
 
 * Free software: MIT license

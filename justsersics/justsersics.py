@@ -1,7 +1,7 @@
 from __future__ import print_function, division
 
 import numpy as np
-import skimage
+import skimage.measure
 from astropy.utils import lazyproperty
 from astropy.modeling.models import Sersic2D
 from astropy.modeling.functional_models import Planar2D

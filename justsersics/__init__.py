@@ -4,5 +4,6 @@ __version__ = '0.1.0'
 
 from .justsersics import *
 from .psf import *
-from . import convert
-from . import masking
+from .utils import *
+from .convert import *
+from .masking import *

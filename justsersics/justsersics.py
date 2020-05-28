@@ -2,6 +2,7 @@ from __future__ import print_function, division
 
 import numpy as np
 import skimage.measure
+from astropy import units as u
 from astropy.utils import lazyproperty
 from astropy.modeling.models import Sersic2D
 from astropy.modeling.functional_models import Planar2D
@@ -16,6 +17,13 @@ DEFAULT_BOUNDS = dict(r_eff=(0, np.inf), n=(0.001, np.inf))
 __all__ = ['PSFConvolvedSersic2D', 'SersicFit']
 
 
+def _check_theta_units(theta):
+    if type(theta) != u.Quantity:
+        logger.warning(f'Will assume input theta = {theta} is in degrees')
+        theta *= u.deg
+    return theta
+
+
 class PSFConvolvedSersic2D(Sersic2D):
     """
     PSF convolved astropy 2D Sersic model.
@@ -26,7 +34,8 @@ class PSFConvolvedSersic2D(Sersic2D):
     """
     
     def __init__(self, psf, amplitude=1, r_eff=1, n=4, x_0=0, y_0=0, 
-                 ellip=0, theta=0, **kwargs):
+                 ellip=0, theta=0 * u.deg, **kwargs):
+        theta = _check_theta_units(theta)
         super().__init__(amplitude, r_eff, n, x_0, y_0, ellip, theta, **kwargs)
         self.sersic_deconvolved = Sersic2D(amplitude, r_eff, n, x_0, y_0, 
                                            ellip, theta, **kwargs)
@@ -117,7 +126,7 @@ class SersicFit(object):
         theta = 0.5 * np.arctan2(2 * sigma_xy, (sigma_x2 - sigma_y2))
         wrapped = np.rad2deg(theta) % 360.0
         wrapped = wrapped - 180 * (wrapped > 180)
-        return wrapped
+        return wrapped * u.deg
 
     @property
     def residual(self):
@@ -131,8 +140,8 @@ class SersicFit(object):
         image_init = dict(
             x_0 = self.centroid[0],
             y_0 = self.centroid[1],
-            r_eff = 1.5 * self.semimajor_axis,
-            theta = np.deg2rad(self.theta),
+            r_eff = self.semimajor_axis,
+            theta = self.theta,
             ellip = self.ellipticity,
             amplitude = 0.3 * self.image[s_].mean(),
             n = 1.0
@@ -158,10 +167,40 @@ class SersicFit(object):
         else:
             ell = EllipticalAperture(
                 self.centroid, scale * self.semimajor_axis,
-                scale * self.semiminor_axis,  np.deg2rad(self.theta)
+                scale * self.semiminor_axis, self.theta.to('radian').value
             )
         ell_mask = ell.to_mask().to_image(self.image.shape).astype(bool)
         return ell_mask
+
+    def _check_params(self, params):
+        if params['ellip'] < 0:
+            logger.debug('ellip < 0: flipping so that ellip > 0')
+            a = (1.0 - params['ellip']) * params['r_eff']
+            b = params['r_eff']
+            params['ellip'] = 1.0 - b / a
+            params['r_eff'] = a
+            params['theta'] -= 90.0 * u.deg
+        elif params['ellip'] > 1:
+            logger.debug('ellip > 1: converting so that 0 < ellip < 1')
+            if abs(1.0 - params['ellip']) < 1:
+                params['ellip'] = 1 - (params['ellip'] % 1) 
+            else:
+                ellip = - (params['ellip'] % 1)
+                a = (1.0 - ellip) * params['r_eff']
+                b = params['r_eff']
+                params['ellip'] = 1.0 - b / a
+                params['r_eff'] = a
+                params['theta'] -= 90.0 * u.deg
+
+        if (params['theta'] > 180 * u.deg) or (params['theta'] < 0 * u.deg):
+            msg = 'wrapping theta = {:.2f} within 0 < theta < 180'.\
+                  format(params['theta'].to('deg'))
+            logger.debug(msg)
+            theta = params['theta'].to('deg').value
+            wrapped = theta % 360.0
+            wrapped = wrapped - 180 * (wrapped > 180)
+            params['theta'] = wrapped * u.deg
+
 
     def fit(self, bounds={}, fixed={}, mask=None, psf=None, 
             fitter=LevMarLSQFitter, fitter_kw={}, tilted_plane=False, 
@@ -195,9 +234,9 @@ class SersicFit(object):
                 tilted_plane_init[k] = v 
             elif k not in self.image_init.keys():
                 raise Exception(f'{k} is not a valid initial parameter')
-            else:
-                init[k] = v
-
+            elif k == 'theta':
+                init[k] = _check_theta_units(v).to('deg')
+        logger.debug(f'Initializing model with params {init}')
         model_init = PSFConvolvedSersic2D(psf, bounds=_bounds, 
                                           fixed=_fixed, **init)
 
@@ -221,43 +260,33 @@ class SersicFit(object):
         else:
             masked_image = self.masked_image
 
+        maxiter = fitter_kw.pop('maxiter', 1000)
         if type(fitter) == fitting._FitterMeta:
             fitter = fitter()
-        sersic_fit = fitter(self.model_init, xx, yy, 
-                            masked_image, **fitter_kw)
-        self.sersic_fitter = sersic_fit
+        model_fit = fitter(self.model_init, xx, yy, masked_image, 
+                            maxiter=maxiter, **fitter_kw)
+        self.model_fitter = model_fit
 
         params = {}
-        for par, val in zip(sersic_fit.param_names, sersic_fit.parameters):
+        for par, val in zip(model_fit.param_names, model_fit.parameters):
             if tilted_plane:
                 par = par[:-2]
             params[par] = val
-        params['theta'] = np.rad2deg(params['theta'])
+        params['theta'] = (params['theta'] * u.radian).to('deg')
+        self._check_params(params)
 
-        if params['ellip'] < 0:
-            logger.debug('ell < 0: flipping so that ell > 0')
-            a = (1.0 - params['ellip']) * params['r_eff']
-            b = params['r_eff']
-            params['ellip'] = 1.0 - b/a
-            params['r_eff'] = a
-            params['theta'] -= 90.0
-
-        if (params['theta'] > 180) or (params['theta'] < 0):
-            msg = 'wrapping theta = {:.2f} within 0 < theta < 180'.\
-                  format(params['theta'])
-            logger.debug(msg)
-            wrapped = params['theta'] % 360.0
-            wrapped = wrapped - 180 * (wrapped > 180)
-            params['theta'] = wrapped
-
-        model_image = sersic_fit(xx, yy)
+        model_image = model_fit(xx, yy)
         if tilted_plane:
             plane = Planar2D(params['slope_x'], params['slope_y'], 
                              params['intercept'])
             self.plane = plane(xx, yy)
             self._sersic = model_image - self.plane
+            self.plane_fit_params = dict(slope_x=params['slope_x'], 
+                                         slope_y=params['slope_y'],
+                                         intercept=params['intercept'])
         else:
             self._sersic = None
         self.fit_params = params
+        self.sersic_fit_params = {k: params[k] for k in self.sersic_params}
         self.model = model_image
         self.fit_info = fitter.fit_info

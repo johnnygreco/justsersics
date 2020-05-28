@@ -1,4 +1,5 @@
 import numpy as np
+from astropy import units as u
 from astropy.modeling.functional_models import Planar2D
 from ..psf import moffat_psf, gaussian_psf
 from ..justsersics import SersicFit
@@ -6,14 +7,12 @@ from ..justsersics import PSFConvolvedSersic2D
 
 
 yy, xx = np.mgrid[:201, :201]
-theta = np.deg2rad(45)
+theta = 45 * u.deg
 sersic_params = dict(r_eff=30, x_0=100, y_0=100, n=1, ellip=0.3, theta=theta)
 
 
 def _check_fit(truth, meas):
     for p, v in truth.items():
-        if p == 'theta':
-            v = np.rad2deg(v)
         assert np.allclose(v, meas[p])
 
 

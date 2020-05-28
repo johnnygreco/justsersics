@@ -164,7 +164,7 @@ class SersicFit(object):
         return ell_mask
 
     def fit(self, bounds={}, fixed={}, mask=None, psf=None, 
-            fitter=LevMarLSQFitter, fitter_kw={}, tilted_plane_init=None, 
+            fitter=LevMarLSQFitter, fitter_kw={}, tilted_plane=False, 
             **init_params): 
         """
         Fit 2D PSF-convoled Sersic function to image.
@@ -175,38 +175,42 @@ class SersicFit(object):
         elif psf is None:
             raise Exception('Must provide PSF!')
 
-        tilted_plane_fixed = {}
-        tilted_plane_bounds = {}
-        for p in self.tilted_plane_params:
-            if p in bounds.keys():
-                tilted_plane_bounds[p] = bounds.pop(p)
-            if p in fixed.keys():
-                tilted_plane_fixed[p] = fixed.pop(p)
-
+        _fixed = fixed.copy()
         _bounds = DEFAULT_BOUNDS.copy()
         for k, v in bounds.items():
             _bounds[k] = v
 
+        tilted_plane_fixed = {}
+        tilted_plane_bounds = {}
+        for p in self.tilted_plane_params:
+            if p in _bounds.keys():
+                tilted_plane_bounds[p] = _bounds.pop(p)
+            if p in _fixed.keys():
+                tilted_plane_fixed[p] = _fixed.pop(p)
+
+        tilted_plane_init = {}
         init = self.image_init.copy()
         for k, v in init_params.items():
-            if k not in self.image_init.keys():
+            if k in self.tilted_plane_params:
+                tilted_plane_init[k] = v 
+            elif k not in self.image_init.keys():
                 raise Exception(f'{k} is not a valid initial parameter')
-            init[k] = v
+            else:
+                init[k] = v
 
-        sersic_init = PSFConvolvedSersic2D(psf, bounds=_bounds, 
-                                           fixed=fixed, **init)
+        model_init = PSFConvolvedSersic2D(psf, bounds=_bounds, 
+                                          fixed=_fixed, **init)
 
-        if tilted_plane_init is not None:
+        if tilted_plane:
             intercept = self.image_init['amplitude'] / 10
             kw = dict(slope_x=0, slope_y=0, intercept=intercept, 
                       bounds=tilted_plane_bounds, fixed=tilted_plane_fixed)
             for k, v in tilted_plane_init.items():
-                assert k in kw.keys(), f'{k} is not a valid plane parameter'
                 kw[k] = v
             self.plane_init = Planar2D(**kw)
-            self.sersic_init = sersic_init + self.plane_init
+            self.model_init = model_init + self.plane_init
         else:
-            self.sersic_init = sersic_init
+            self.model_init = model_init
 
         ny, nx = self.image.shape
         yy, xx = np.mgrid[:ny, :nx]
@@ -219,13 +223,13 @@ class SersicFit(object):
 
         if type(fitter) == fitting._FitterMeta:
             fitter = fitter()
-        sersic_fit = fitter(self.sersic_init, xx, yy, 
+        sersic_fit = fitter(self.model_init, xx, yy, 
                             masked_image, **fitter_kw)
         self.sersic_fitter = sersic_fit
 
         params = {}
         for par, val in zip(sersic_fit.param_names, sersic_fit.parameters):
-            if tilted_plane_init is not None:
+            if tilted_plane:
                 par = par[:-2]
             params[par] = val
         params['theta'] = np.rad2deg(params['theta'])
@@ -247,7 +251,7 @@ class SersicFit(object):
             params['theta'] = wrapped
 
         model_image = sersic_fit(xx, yy)
-        if tilted_plane_init is not None:
+        if tilted_plane:
             plane = Planar2D(params['slope_x'], params['slope_y'], 
                              params['intercept'])
             self.plane = plane(xx, yy)

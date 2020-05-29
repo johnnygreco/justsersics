@@ -236,6 +236,8 @@ class SersicFit(object):
                 raise Exception(f'{k} is not a valid initial parameter')
             elif k == 'theta':
                 init[k] = _check_theta_units(v).to('deg')
+            else:
+                init[k] = v
         logger.debug(f'Initializing model with params {init}')
         model_init = PSFConvolvedSersic2D(psf, bounds=_bounds, 
                                           fixed=_fixed, **init)
